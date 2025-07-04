@@ -360,32 +360,6 @@ class PipeStep(Generic[T, R]):
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(None, self.func, *args, **kwargs)
 
-    def _prepare_args(self, input_value: Any) -> Tuple[Tuple[Any, ...], Dict[str, Any]]:
-        """Prepare function arguments with PIPE injection."""
-        args = list(self._args)
-        kwargs = dict(self._kwargs)
-
-        # Handle PIPE injection
-        if PIPE in args:
-            args = [input_value if arg is PIPE else arg for arg in args]
-        elif PIPE in kwargs.values():
-            kwargs = {k: (input_value if v is PIPE else v) for k, v in kwargs.items()}
-        elif input_value is not PIPE and not args and not kwargs:
-            # Check if function can accept arguments before adding input_value
-            sig = inspect.signature(self.func)
-            params = list(sig.parameters.values())
-
-            # Only add input_value if function can accept it
-            if params and (
-                    # Has positional parameters
-                    any(p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) for p in params) or
-                    # Has *args parameter
-                    any(p.kind == p.VAR_POSITIONAL for p in params)
-            ):
-                args = [input_value]
-            # If function takes no arguments, don't pass input_value
-        return tuple(args), kwargs
-
     def _should_parallelize(self, args: Tuple[Any, ...]) -> bool:
         """Check if parallel execution should be used."""
         return (len(args) == 1 and
