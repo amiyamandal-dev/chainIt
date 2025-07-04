@@ -329,7 +329,7 @@ async def test_async_fan_out():
     duration = time.perf_counter() - start
 
     assert result == (10, 10)
-    assert duration < 0.1  # Allow some slack for slower environments
+    assert duration < 0.05  # Should run in parallel
 
 # =============================================================================
 # Async Execution Tests
@@ -368,8 +368,7 @@ def test_large_data_throughput():
     duration = time.perf_counter() - start
 
     # Fixed: Check absolute difference instead of direct comparison
-    n_batches = (len(data) + 9999) // 10000
-    expected = sum(np.mean(data[i:i + 10000]) for i in range(0, len(data), 10000))
+    expected = np.mean(data)
     assert abs(result - expected) < 1e-6
     assert duration < 1.0  # Should process quickly
 
@@ -428,7 +427,7 @@ def test_full_integration():
 
     @circuit_breaker(failure_threshold=2)  # Fixed: Use correct parameter name
     @retry(max_attempts=3)
-    @piped(parallel='thread')
+    @piped
     def flaky_operation(x):
         counter.increment()
         if x == 4 and counter.count < 3:
