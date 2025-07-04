@@ -1,4 +1,3 @@
-# pipeline_fast.py - Optimized for maximum performance
 from __future__ import annotations
 import asyncio
 import functools
