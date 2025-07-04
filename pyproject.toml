@@ -1,9 +1,9 @@
 [project]
 name = "chainit"
 version = "0.1.0"
-description = "Add your description here"
+description = "Lightweight pipeline utilities"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = ["numpy", "cffi"]
 
 [tool.pytest.ini_options]
 pythonpath = [
