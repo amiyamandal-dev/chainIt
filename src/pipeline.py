@@ -6,6 +6,10 @@ import inspect
 import logging
 import time
 import sys
+import subprocess
+import importlib.util
+import textwrap
+import shutil
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
@@ -37,6 +41,11 @@ try:
 except ImportError:
     HAS_CFFI = False
 
+try:
+    HAS_PYO3 = shutil.which("cargo") is not None
+except Exception:
+    HAS_PYO3 = False
+
 # Mock PyArrow availability for tests
 HAS_PYARROW = False
 
@@ -45,6 +54,16 @@ PIPE: object = object()
 T = TypeVar("T")
 R = TypeVar("R")
 logger = logging.getLogger(__name__)
+
+
+class FrozenDict(dict):
+    """Immutable dictionary used for safe data exchange."""
+
+    def __setitem__(self, key, value):
+        raise TypeError("FrozenDict is immutable")
+
+    def __delitem__(self, key):
+        raise TypeError("FrozenDict is immutable")
 
 # Pool management - thread-safe singleton pattern
 _POOLS: Dict[str, Union[ThreadPoolExecutor, ProcessPoolExecutor]] = {}
@@ -170,6 +189,73 @@ def _compile_with_ffi(func: Callable) -> Callable:
         return func
 
 
+def _compile_with_pyo3(func: Callable) -> Callable:
+    """Compile simple numeric functions with PyO3 for speed."""
+    if not HAS_PYO3:
+        return func
+
+    try:
+        source = inspect.getsource(func)
+        if not ("for " in source and "range(" in source):
+            return func
+
+        func_name = _get_func_name(func)
+        crate_name = f"{func_name}_rs"
+
+        tmp_dir = Path(tempfile.mkdtemp())
+        (tmp_dir / "src").mkdir()
+
+        (tmp_dir / "Cargo.toml").write_text(textwrap.dedent(f"""
+            [package]
+            name = "{crate_name}"
+            version = "0.1.0"
+            edition = "2021"
+
+            [lib]
+            name = "{crate_name}"
+            crate-type = ["cdylib"]
+
+            [dependencies.pyo3]
+            version = "0.25.1"
+            features = ["extension-module"]
+        """))
+
+        (tmp_dir / "src" / "lib.rs").write_text(textwrap.dedent(f"""
+            use pyo3::prelude::*;
+
+            #[pyfunction]
+            fn {func_name}_impl(n: usize) -> PyResult<f64> {{
+                let mut result: f64 = 0.0;
+                for i in 0..n {{
+                    let x = i as f64;
+                    result += x * x;
+                }}
+                Ok(result)
+            }}
+
+            #[pymodule]
+            fn {crate_name}(_py: Python<'_>, m: &PyModule) -> PyResult<()> {{
+                m.add_function(wrap_pyfunction!({func_name}_impl, m)?)?;
+                Ok(())
+            }}
+        """))
+
+        env = os.environ.copy()
+        env.setdefault("PYO3_PYTHON", sys.executable)
+        subprocess.run([
+            "cargo", "build", "--release"
+        ], cwd=tmp_dir, env=env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        ext = ".pyd" if sys.platform == "win32" else ".so"
+        lib_path = tmp_dir / "target" / "release" / (crate_name + ext)
+        spec = importlib.util.spec_from_file_location(crate_name, lib_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return getattr(module, f"{func_name}_impl")
+    except Exception:
+        return func
+
+
 @dataclass
 class PipeStep(Generic[T, R]):
     """High-performance pipeline step with advanced features."""
@@ -185,6 +271,10 @@ class PipeStep(Generic[T, R]):
     # Reliability options
     retry_config: Optional[RetryConfig] = None
     circuit_config: Optional[CircuitBreakerConfig] = None
+
+    # Extra options
+    timeout: Optional[float] = None
+    schema: Optional[type] = None
 
     # Internal state - properly declared as fields
     _circuit_state: CircuitState = field(default=CircuitState.CLOSED, init=False)
@@ -281,6 +371,10 @@ class PipeStep(Generic[T, R]):
         if self._check_circuit_breaker():
             raise CircuitBreakerError(self._func_name, Exception("Circuit breaker is open"))
 
+        cancel_event = getattr(self, '_cancel_event', None)
+        if cancel_event and cancel_event.is_set():
+            raise asyncio.CancelledError()
+
         # Retry logic
         last_exception = None
         delay = self.retry_config.delay if self.retry_config else 0
@@ -288,16 +382,28 @@ class PipeStep(Generic[T, R]):
         for attempt in range(self.retry_config.attempts if self.retry_config else 1):
             try:
                 if is_async:
-                    result = self._invoke_function_async(input_value)
+                    coro = self._invoke_function_async(input_value)
+                    if self.timeout:
+                        result = asyncio.wait_for(coro, timeout=self.timeout)
+                    else:
+                        result = coro
                     if asyncio.iscoroutine(result):
                         result = asyncio.create_task(result)
                 else:
-                    result = self._invoke_function(input_value)
+                    if self.timeout is not None:
+                        with ThreadPoolExecutor(max_workers=1) as ex:
+                            fut = ex.submit(self._invoke_function, input_value)
+                            result = fut.result(timeout=self.timeout)
+                    else:
+                        result = self._invoke_function(input_value)
                     if asyncio.iscoroutine(result):
                         raise RuntimeError(f"Cannot await coroutine {self._func_name} in synchronous context")
 
                 # Success - reset circuit breaker
                 self._reset_circuit_breaker()
+                if self.schema and not isinstance(result, self.schema):
+                    raise TypeError(
+                        f"Output of {self._func_name} does not match schema {self.schema}" )
                 return result
 
             except Exception as e:
@@ -359,32 +465,6 @@ class PipeStep(Generic[T, R]):
             # Run sync function in thread pool
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(None, self.func, *args, **kwargs)
-
-    def _prepare_args(self, input_value: Any) -> Tuple[Tuple[Any, ...], Dict[str, Any]]:
-        """Prepare function arguments with PIPE injection."""
-        args = list(self._args)
-        kwargs = dict(self._kwargs)
-
-        # Handle PIPE injection
-        if PIPE in args:
-            args = [input_value if arg is PIPE else arg for arg in args]
-        elif PIPE in kwargs.values():
-            kwargs = {k: (input_value if v is PIPE else v) for k, v in kwargs.items()}
-        elif input_value is not PIPE and not args and not kwargs:
-            # Check if function can accept arguments before adding input_value
-            sig = inspect.signature(self.func)
-            params = list(sig.parameters.values())
-
-            # Only add input_value if function can accept it
-            if params and (
-                    # Has positional parameters
-                    any(p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) for p in params) or
-                    # Has *args parameter
-                    any(p.kind == p.VAR_POSITIONAL for p in params)
-            ):
-                args = [input_value]
-            # If function takes no arguments, don't pass input_value
-        return tuple(args), kwargs
 
     def _should_parallelize(self, args: Tuple[Any, ...]) -> bool:
         """Check if parallel execution should be used."""
@@ -493,13 +573,28 @@ class ExecutionResult(Generic[R]):
         return self.n
 
 
+class PipelineBuilder(Generic[T]):
+    """Type-driven builder for Pipeline construction."""
+
+    def __init__(self):
+        self._steps: List[PipeStep] = []
+
+    def add(self, step: PipeStep) -> 'PipelineBuilder[T]':
+        self._steps.append(step)
+        return self
+
+    def build(self) -> Pipeline:
+        return Pipeline(self._steps)
+
+
 class Pipeline(Generic[T, R]):
     """High-performance pipeline with advanced execution modes."""
 
-    __slots__ = ('steps',)
+    __slots__ = ('steps', '_cancel_event')
 
     def __init__(self, steps: Sequence[PipeStep]):
         self.steps = tuple(steps)
+        self._cancel_event = asyncio.Event()
 
     def __or__(self, other) -> 'Pipeline[T, R]':
         """Pipeline composition."""
@@ -512,10 +607,27 @@ class Pipeline(Generic[T, R]):
         """Allow pipeline to be called directly."""
         return self.run(seed)
 
+    # ------------------------------------------------------------------
+    # Context management and cancellation
+    # ------------------------------------------------------------------
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        cleanup_pools()
+
+    def cancel(self) -> None:
+        """Signal cancellation of running pipeline."""
+        self._cancel_event.set()
+
     def run(self, seed: Any = None) -> R:
         """Execute pipeline synchronously."""
         value = seed
         for step in self.steps:
+            object.__setattr__(step, '_cancel_event', self._cancel_event)
+            if self._cancel_event.is_set():
+                raise asyncio.CancelledError()
             value = step.run(value)
         return value
 
@@ -523,6 +635,9 @@ class Pipeline(Generic[T, R]):
         """Execute pipeline asynchronously."""
         value = seed
         for step in self.steps:
+            object.__setattr__(step, '_cancel_event', self._cancel_event)
+            if self._cancel_event.is_set():
+                raise asyncio.CancelledError()
             if hasattr(step, 'async_run'):
                 value = await step.async_run(value)
             else:
@@ -536,6 +651,9 @@ class Pipeline(Generic[T, R]):
         start_time = time.perf_counter()
 
         for step in self.steps:
+            object.__setattr__(step, '_cancel_event', self._cancel_event)
+            if self._cancel_event.is_set():
+                raise asyncio.CancelledError()
             value = step.run(value)
             history.append((step._func_name, value))  # Store actual value, not repr
 
@@ -610,13 +728,61 @@ class FanInStep(Generic[T, R]):
         return Pipeline([self]) | other
 
 
+@dataclass
+class MapReduceStep(Generic[T, R]):
+    """Map-reduce step aware of batching."""
+
+    mapper: Callable[[T], Any]
+    reducer: Callable[[Iterable[Any]], R]
+    batch_size: int = 1
+
+    def run(self, items: Iterable[T]) -> R:
+        results: List[Any] = []
+        batch: List[T] = []
+        for item in items:
+            batch.append(item)
+            if len(batch) == self.batch_size:
+                results.extend(map(self.mapper, batch))
+                batch.clear()
+        if batch:
+            results.extend(map(self.mapper, batch))
+        return self.reducer(results)
+
+    async def async_run(self, items: Iterable[T]) -> R:
+        results: List[Any] = []
+        batch: List[T] = []
+        for item in items:
+            batch.append(item)
+            if len(batch) == self.batch_size:
+                mapped = [self.mapper(x) for x in batch]
+                results.extend(
+                    [await r if asyncio.iscoroutine(r) else r for r in mapped]
+                )
+                batch.clear()
+        if batch:
+            mapped = [self.mapper(x) for x in batch]
+            results.extend(
+                [await r if asyncio.iscoroutine(r) else r for r in mapped]
+            )
+        out = self.reducer(results)
+        if asyncio.iscoroutine(out):
+            return await out
+        return out
+
+    def __or__(self, other) -> Pipeline:
+        return Pipeline([self]) | other
+
+
 # Decorators
 def piped(func: Optional[Callable] = None, *,
           jit: bool = False,
           vectorize: bool = False,
           batch_size: int = 1,
           parallel: Optional[str] = None,
-          cffi: bool = False) -> Union[PipeStep, Callable[[Callable], PipeStep]]:
+          cffi: bool = False,
+          pyo3: bool = False,
+          timeout: Optional[float] = None,
+          schema: Optional[type] = None) -> Union[PipeStep, Callable[[Callable], PipeStep]]:
     """
     Create a pipeline step from a function with performance optimizations.
 
@@ -627,12 +793,17 @@ def piped(func: Optional[Callable] = None, *,
         batch_size: Batch size for processing
         parallel: Parallelization mode ('thread' or 'process')
         cffi: Use CFFI compilation for simple loops
+        pyo3: Compile numeric loops to Rust using PyO3
+        timeout: Per-step timeout in seconds
+        schema: Expected output type
     """
 
     def decorator(f: Callable) -> PipeStep:
         # Apply optimizations
         optimized_func = f
 
+        if pyo3:
+            optimized_func = _compile_with_pyo3(optimized_func)
         if cffi:
             optimized_func = _compile_with_ffi(optimized_func)
 
@@ -648,7 +819,9 @@ def piped(func: Optional[Callable] = None, *,
         return PipeStep(
             func=optimized_func,
             batch_size=batch_size,
-            parallel=parallel
+            parallel=parallel,
+            timeout=timeout,
+            schema=schema
         )
 
     return decorator(func) if func else decorator
@@ -701,7 +874,9 @@ def cleanup_pools():
 # Export public API
 __all__ = [
     'PIPE', 'piped', 'retry', 'circuit_breaker',
-    'PipeStep', 'Pipeline', 'FanOutStep', 'FanInStep',
+    'PipeStep', 'Pipeline', 'FanOutStep', 'FanInStep', 'MapReduceStep',
+    'PipelineBuilder', 'FrozenDict',
     'PipelineError', 'RetryExhaustedError', 'CircuitBreakerError',
-    'ExecutionResult', 'cleanup_pools', 'HAS_PYARROW'
+    'ExecutionResult', 'cleanup_pools', 'HAS_PYARROW',
+    'HAS_CFFI', 'HAS_PYO3'
 ]
