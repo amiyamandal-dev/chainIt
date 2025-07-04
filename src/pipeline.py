@@ -88,27 +88,24 @@ class CircuitBreakerError(PipelineError):
 # Data Classes with Slots
 # =============================================================================
 
-@dataclass(frozen=True)
+@dataclass(slots=True, frozen=True)
 class ExecutionResult(Generic[T]):
-    __slots__ = ("value", "history", "execution_time", "step_count")
     value: T
     history: Tuple[Tuple[str, Any], ...] = ()
     execution_time: float = 0.0
     step_count: int = 0
 
 
-@dataclass(frozen=True)
+@dataclass(slots=True, frozen=True)
 class RetryConfig:
-    __slots__ = ("max_attempts", "delay", "backoff_factor", "exceptions")
     max_attempts: int = 3
     delay: float = 1.0
     backoff_factor: float = 2.0
     exceptions: Tuple[type, ...] = (Exception,)
 
 
-@dataclass(frozen=True)
+@dataclass(slots=True, frozen=True)
 class CircuitBreakerConfig:
-    __slots__ = ("failure_threshold", "recovery_timeout", "half_open_max_calls")
     failure_threshold: int = 5
     recovery_timeout: float = 60.0
     half_open_max_calls: int = 3
@@ -261,6 +258,33 @@ class PipeStep(Generic[T, R]):
         self.batch_size = batch_size
         self.executor_type = executor_type
 
+    # ------------------------------------------------------------------
+    # Helper interface
+    # ------------------------------------------------------------------
+
+    def __call__(self, *args: Any, **kwargs: Any) -> "PipeStep":
+        """Return a new step with stored arguments."""
+        return PipeStep(
+            func=self.func,
+            stored_args=args,
+            stored_kwargs=kwargs,
+            retry_config=self.retry_config,
+            circuit_breaker_config=self.circuit_breaker_config,
+            is_method=self.is_method,
+            is_jitted=self.is_jitted,
+            is_vectorized=self.is_vectorized,
+            batch_size=self.batch_size,
+            executor_type=self.executor_type,
+        )
+
+    def run(self, injected_value: Any = _MISSING) -> R:
+        """Synchronously execute this step."""
+        return self.execute_sync(injected_value)
+
+    async def async_run(self, injected_value: Any = _MISSING) -> R:
+        """Asynchronously execute this step."""
+        return await self.execute_async(injected_value)
+
     async def execute_async(self, injected_value: Any = _MISSING) -> R:
         args, kwargs = self._prepare_args(injected_value)
         return await self._execute(args, kwargs)
@@ -272,6 +296,9 @@ class PipeStep(Generic[T, R]):
     def _prepare_args(self, injected_value: Any) -> Tuple[Tuple, Dict]:
         if injected_value is _MISSING:
             return self.stored_args, dict(self.stored_kwargs)
+
+        if not self.stored_args and not self.stored_kwargs:
+            return (injected_value,), {}
 
         args = tuple(
             injected_value if arg is PIPE else arg
@@ -509,6 +536,41 @@ class Pipeline(Generic[T, R]):
                 except Exception:
                     pass
 
+    def _get_step_name(self, step: Any) -> str:
+        if isinstance(step, PipeStep):
+            return step.func.__name__
+        if isinstance(step, FanOutStep):
+            return "FanOutStep"
+        if isinstance(step, FanInStep):
+            return step.combiner.__name__
+        return type(step).__name__
+
+    # ------------------------------------------------------------------
+    # Execution helpers
+    # ------------------------------------------------------------------
+
+    def run(self, seed: T | None = None) -> R:
+        """Run the pipeline synchronously and return the final value."""
+        return self.run_detailed(seed).value
+
+    async def async_run(self, seed: T | None = None) -> R:
+        """Run the pipeline asynchronously and return the final value."""
+        value = seed
+        for step in self.steps:
+            step_name = self._get_step_name(step)
+            try:
+                if isinstance(step, (PipeStep, FanInStep)):
+                    value = await step.execute_async(value)
+                elif isinstance(step, FanOutStep):
+                    value = await step.execute_async(value)
+                if self.debug:
+                    logger.debug("Step %s: %s", step_name, value)
+            except Exception as exc:
+                if not isinstance(exc, PipelineError):
+                    exc = PipelineError(step_name, exc)
+                raise exc
+        return value
+
     # ... (rest of the Pipeline class remains similar to v3 with optimizations below)
 
     def run_detailed(self, seed: T | None = None) -> ExecutionResult[R]:
@@ -585,7 +647,7 @@ def piped(
 ) -> Callable:
     """Enhanced pipeline step decorator with JIT options"""
 
-    def decorator(f: Callable) -> Callable:
+    def decorator(f: Callable) -> PipeStep:
         nonlocal jit, vectorize
 
         # Apply JIT if requested
@@ -609,8 +671,7 @@ def piped(
         # Get function properties
         is_method, is_async, is_native_vectorized = _get_func_properties(f)
 
-        @functools.wraps(f)
-        def wrapper(*args, **kwargs) -> PipeStep:
+        def factory(*args, **kwargs) -> PipeStep:
             return PipeStep(
                 func=f,
                 stored_args=args,
@@ -619,10 +680,10 @@ def piped(
                 is_jitted=jit_applied,
                 is_vectorized=vectorize_applied or is_native_vectorized,
                 batch_size=batch_size,
-                executor_type=parallel
+                executor_type=parallel,
             )
 
-        return wrapper
+        return factory()
 
     if func:
         return decorator(func)
@@ -638,17 +699,10 @@ def retry(
 ) -> Callable:
     """Retry decorator with JIT passthrough"""
 
-    def decorator(func: Callable) -> Callable:
-        piped_decorator = piped(**piped_kwargs)
-        wrapped = piped_decorator(func)
-
-        @functools.wraps(wrapped)
-        def wrapper(*args, **kwargs) -> PipeStep:
-            step = wrapped(*args, **kwargs)
-            step.retry_config = RetryConfig(max_attempts, delay, backoff_factor, exceptions)
-            return step
-
-        return wrapper
+    def decorator(func: Callable) -> PipeStep:
+        step = piped(**piped_kwargs)(func)
+        step.retry_config = RetryConfig(max_attempts, delay, backoff_factor, exceptions)
+        return step
 
     return decorator
 
@@ -661,19 +715,12 @@ def circuit_breaker(
 ) -> Callable:
     """Circuit breaker decorator with JIT passthrough"""
 
-    def decorator(func: Callable) -> Callable:
-        piped_decorator = piped(**piped_kwargs)
-        wrapped = piped_decorator(func)
-
-        @functools.wraps(wrapped)
-        def wrapper(*args, **kwargs) -> PipeStep:
-            step = wrapped(*args, **kwargs)
-            step.circuit_breaker_config = CircuitBreakerConfig(
-                failure_threshold, recovery_timeout, half_open_max_calls
-            )
-            return step
-
-        return wrapper
+    def decorator(func: Callable) -> PipeStep:
+        step = piped(**piped_kwargs)(func)
+        step.circuit_breaker_config = CircuitBreakerConfig(
+            failure_threshold, recovery_timeout, half_open_max_calls
+        )
+        return step
 
     return decorator
 
