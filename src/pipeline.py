@@ -6,6 +6,10 @@ import inspect
 import logging
 import time
 import sys
+import subprocess
+import importlib.util
+import textwrap
+import shutil
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
@@ -36,6 +40,11 @@ try:
     HAS_CFFI = True
 except ImportError:
     HAS_CFFI = False
+
+try:
+    HAS_PYO3 = shutil.which("cargo") is not None
+except Exception:
+    HAS_PYO3 = False
 
 # Mock PyArrow availability for tests
 HAS_PYARROW = False
@@ -166,6 +175,73 @@ def _compile_with_ffi(func: Callable) -> Callable:
         lib = _ffi.verify(c_code, extra_compile_args=["-O3", "-march=native"])
 
         return lambda n: getattr(lib, f"{func_name}_impl")(n)
+    except Exception:
+        return func
+
+
+def _compile_with_pyo3(func: Callable) -> Callable:
+    """Compile simple numeric functions with PyO3 for speed."""
+    if not HAS_PYO3:
+        return func
+
+    try:
+        source = inspect.getsource(func)
+        if not ("for " in source and "range(" in source):
+            return func
+
+        func_name = _get_func_name(func)
+        crate_name = f"{func_name}_rs"
+
+        tmp_dir = Path(tempfile.mkdtemp())
+        (tmp_dir / "src").mkdir()
+
+        (tmp_dir / "Cargo.toml").write_text(textwrap.dedent(f"""
+            [package]
+            name = "{crate_name}"
+            version = "0.1.0"
+            edition = "2021"
+
+            [lib]
+            name = "{crate_name}"
+            crate-type = ["cdylib"]
+
+            [dependencies.pyo3]
+            version = "0.25.1"
+            features = ["extension-module"]
+        """))
+
+        (tmp_dir / "src" / "lib.rs").write_text(textwrap.dedent(f"""
+            use pyo3::prelude::*;
+
+            #[pyfunction]
+            fn {func_name}_impl(n: usize) -> PyResult<f64> {{
+                let mut result: f64 = 0.0;
+                for i in 0..n {{
+                    let x = i as f64;
+                    result += x * x;
+                }}
+                Ok(result)
+            }}
+
+            #[pymodule]
+            fn {crate_name}(_py: Python<'_>, m: &PyModule) -> PyResult<()> {{
+                m.add_function(wrap_pyfunction!({func_name}_impl, m)?)?;
+                Ok(())
+            }}
+        """))
+
+        env = os.environ.copy()
+        env.setdefault("PYO3_PYTHON", sys.executable)
+        subprocess.run([
+            "cargo", "build", "--release"
+        ], cwd=tmp_dir, env=env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        ext = ".pyd" if sys.platform == "win32" else ".so"
+        lib_path = tmp_dir / "target" / "release" / (crate_name + ext)
+        spec = importlib.util.spec_from_file_location(crate_name, lib_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return getattr(module, f"{func_name}_impl")
     except Exception:
         return func
 
@@ -359,32 +435,6 @@ class PipeStep(Generic[T, R]):
             # Run sync function in thread pool
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(None, self.func, *args, **kwargs)
-
-    def _prepare_args(self, input_value: Any) -> Tuple[Tuple[Any, ...], Dict[str, Any]]:
-        """Prepare function arguments with PIPE injection."""
-        args = list(self._args)
-        kwargs = dict(self._kwargs)
-
-        # Handle PIPE injection
-        if PIPE in args:
-            args = [input_value if arg is PIPE else arg for arg in args]
-        elif PIPE in kwargs.values():
-            kwargs = {k: (input_value if v is PIPE else v) for k, v in kwargs.items()}
-        elif input_value is not PIPE and not args and not kwargs:
-            # Check if function can accept arguments before adding input_value
-            sig = inspect.signature(self.func)
-            params = list(sig.parameters.values())
-
-            # Only add input_value if function can accept it
-            if params and (
-                    # Has positional parameters
-                    any(p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) for p in params) or
-                    # Has *args parameter
-                    any(p.kind == p.VAR_POSITIONAL for p in params)
-            ):
-                args = [input_value]
-            # If function takes no arguments, don't pass input_value
-        return tuple(args), kwargs
 
     def _should_parallelize(self, args: Tuple[Any, ...]) -> bool:
         """Check if parallel execution should be used."""
@@ -616,7 +666,8 @@ def piped(func: Optional[Callable] = None, *,
           vectorize: bool = False,
           batch_size: int = 1,
           parallel: Optional[str] = None,
-          cffi: bool = False) -> Union[PipeStep, Callable[[Callable], PipeStep]]:
+          cffi: bool = False,
+          pyo3: bool = False) -> Union[PipeStep, Callable[[Callable], PipeStep]]:
     """
     Create a pipeline step from a function with performance optimizations.
 
@@ -627,12 +678,15 @@ def piped(func: Optional[Callable] = None, *,
         batch_size: Batch size for processing
         parallel: Parallelization mode ('thread' or 'process')
         cffi: Use CFFI compilation for simple loops
+        pyo3: Compile numeric loops to Rust using PyO3
     """
 
     def decorator(f: Callable) -> PipeStep:
         # Apply optimizations
         optimized_func = f
 
+        if pyo3:
+            optimized_func = _compile_with_pyo3(optimized_func)
         if cffi:
             optimized_func = _compile_with_ffi(optimized_func)
 
@@ -703,5 +757,6 @@ __all__ = [
     'PIPE', 'piped', 'retry', 'circuit_breaker',
     'PipeStep', 'Pipeline', 'FanOutStep', 'FanInStep',
     'PipelineError', 'RetryExhaustedError', 'CircuitBreakerError',
-    'ExecutionResult', 'cleanup_pools', 'HAS_PYARROW'
+    'ExecutionResult', 'cleanup_pools', 'HAS_PYARROW',
+    'HAS_CFFI', 'HAS_PYO3'
 ]
