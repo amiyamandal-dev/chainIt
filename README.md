@@ -1,190 +1,270 @@
-# High‑Performance Pipeline Framework
+# ⚡️ High‑Performance Pipeline Framework
 
-A flexible, **zero‑boilerplate** data‑processing pipeline library for Python 3.9+ that combines:
+> **Turn plain Python functions into production‑ready, observable pipelines in minutes.**
 
-* ✨ *Declarative* pipeline construction (`step1 | step2 | step3`)
-* 🚀 Runtime performance boosts (Numba JIT, NumPy vectorize, CFFI, PyO3/Rust)
-* 🪄 Transparent sync **and** async execution
-* 🧵 Thread / 🧩 process parallelism + batching
-* ♻️ Automatic retry & circuit‑breaker patterns
-* 🗂 Fan‑out / fan‑in and map‑reduce helpers
-* ⏱ Per‑step timeouts and rich execution telemetry
-
-If you need to turn a list of plain Python functions into a production‑ready, observable data pipeline **without reaching for heavy frameworks**, this repository is for you.
+[![PyPI](https://img.shields.io/pypi/v/pipeline-framework.svg)](https://pypi.org/project/pipeline-framework/) 
+![Python](https://img.shields.io/pypi/pyversions/pipeline-framework.svg) 
+[![License](https://img.shields.io/github/license/your-org/pipeline-framework.svg)](LICENSE)
 
 ---
 
-## Table of contents
+## ✨ Why choose this library?
 
-* [Installation](#installation)
-* [Quick start](#quick-start)
-* [Pipeline primitives](#pipeline-primitives)
-* [Performance optimisations](#performance-optimisations)
-* [Reliability features](#reliability-features)
-* [Advanced patterns](#advanced-patterns)
-* [API reference](#api-reference)
-* [Contributing](#contributing)
-* [License](#license)
+| What you get                      | How it helps                                                         |       |                                |
+| --------------------------------- | -------------------------------------------------------------------- | ----- | ------------------------------ |
+| **Zero‑boilerplate DSL**          | Compose with \`step1                                                 | step2 | step3\` – no classes required. |
+| **Sync ✓  Async ✓**               | Same codebase for notebooks **and** production services.             |       |                                |
+| **Built‑in performance knobs**    | Numba JIT, NumPy vectorization, CFFI, PyO3/Rust, batching & pools.   |       |                                |
+| **Reliability patterns**          | Automatic retry, exponential back‑off, circuit‑breaker.              |       |                                |
+| **Fan‑out / Fan‑in & Map‑Reduce** | Express complex graphs without 3rd‑party DAG engines.                |       |                                |
+| **Rich telemetry**                | Per‑step timings and full execution history for debugging/profiling. |       |                                |
+
+> **Ideal for** ETL jobs, scientific data‑flows, ML preprocessing, microservice glue code, or any place you’d otherwise write ad‑hoc `for` loops.
 
 ---
 
-## Installation
+## 🔧 Installation
 
 ```bash
-# clone the repo
-git clone https://github.com/<your‑org>/pipeline.git
-cd pipeline
+pip install pipeline-framework  # core (NumPy dependency only)
 
-# create a virtual env (recommended)
-python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
-
-# core dependencies
-pip install -r requirements.txt
-# or bare minimum
-pip install numpy
-
-# optional perf extras
-pip install numba        # JIT
-pip install cffi         # CFFI loop compilation
-# for PyO3/Rust you need the Rust tool‑chain & cargo in PATH
+# Optional performance extras
+pip install "pipeline-framework[numba,cffi]"  # JIT + CFFI loops
+# PyO3 requires Rust and cargo in PATH (see docs)
 ```
 
-> **Note**
-> The library checks at runtime whether optional dependencies are present and
-> falls back gracefully if they are not.
+> The library autodetects extras at runtime and degrades gracefully when they’re missing.
 
 ---
 
-## Quick start
+## 🚀 Quick Start
 
 ```python
-from pipeline import piped, PIPE, Pipeline, retry, circuit_breaker
+from pipeline import piped, PIPE, Pipeline
 
 @piped
-def step_add(x: int) -> int:
+def add_one(x):
     return x + 1
 
 @piped(batch_size=4, parallel='thread')
-def step_square(nums):
+def square(nums):
     return [n * n for n in nums]
 
-@piped(vectorize=True)
-def step_sqrt(x: float) -> float:
-    import math; return math.sqrt(x)
-
-# reliability decorators
-step_square = retry(max_attempts=3)(step_square)
-step_sqrt   = circuit_breaker(threshold=5, timeout=30)(step_sqrt)
-
-pipeline = step_add | step_square | step_sqrt
-
-result = pipeline.run([1, 2, 3, 4])
-print(result)            # -> [1.4142, 1.7320, 2.0, 2.2360]
+pipeline = add_one | square
+print(pipeline.run([1, 2, 3, 4]))  # 👉 [4, 9, 16, 25]
 ```
 
-### Async execution
+Need async? Same code:
 
 ```python
 import asyncio
-result = asyncio.run(pipeline.async_run([10, 11, 12, 13]))
+asyncio.run(pipeline.async_run([10, 11, 12]))
 ```
 
 ---
 
-## Pipeline primitives
+## 🧩 Core Concepts
 
-| Primitive         | Purpose                                                          |            |
-| ----------------- | ---------------------------------------------------------------- | ---------- |
-| `PipeStep`        | Thin wrapper around a callable; exposes perf & reliability knobs |            |
-| `Pipeline`        | Immutable sequence of `PipeStep`s (\`step1                       | step2 …\`) |
-| `FanOutStep`      | Broadcasts a value to N branches in parallel                     |            |
-| `FanInStep`       | Combines outputs from N branches with a custom combiner          |            |
-| `MapReduceStep`   | Map‑phase (with batching) + reduce‑phase convenience             |            |
-| `PipelineBuilder` | Type‑driven fluent builder (alternative to \`                    | \` pipe)   |
+### 1. `PipeStep`
 
----
+Lightweight wrapper that stores **how** a function should run (batch size, pool, retry policy, etc.). Create steps with the `@piped` decorator.
 
-## Performance optimisations
+### 2. `Pipeline`
 
-| Technique     | How to enable                                | Speed‑up  |
-| ------------- | -------------------------------------------- | --------- |
-| **Numba JIT** | `@piped(jit=True)`                           | 2‑100×    |
-| **Vectorize** | `@piped(vectorize=True)` (Numba or NumPy)    | 10‑30×    |
-| **CFFI**      | `@piped(cffi=True)` for simple numeric loops | 5‑20×     |
-| **PyO3/Rust** | `@piped(pyo3=True)` (requires Rust)          | 10‑50×    |
-| **Parallel**  | `@piped(parallel='thread')` or `'process'`   | CPU bound |
-| **Batching**  | `@piped(batch_size=1024)`                    | I/O bound |
+Immutable sequence of `PipeStep`s. Use the `|` operator or the fluent `PipelineBuilder`.
 
-All optimisations are **opt‑in** at decoration time; unsafe combinations are rejected at runtime (e.g. non‑pickleable func + process pool).
+### 3. Special Steps
+
+* **`FanOutStep`** – broadcast input to multiple branches (optionally in parallel).
+* **`FanInStep`**  – merge branch outputs with a custom combiner.
+* **`MapReduceStep`** – convenience for batched map → reduce patterns.
 
 ---
 
-## Reliability features
-
-### Retry
+## 🏎️ Performance Toggles
 
 ```python
+@piped(jit=True)                      # Numba                                           
+@piped(vectorize=True)                # NumPy/Numba ufuncs                              
+@piped(parallel='process')            # Process pool (auto‑picklable check)            
+@piped(batch_size=1024)               # Batch incoming iterables                        
+@piped(cffi=True)                     # Compile simple loops to C                       
+@piped(pyo3=True)                     # Compile numeric loop to Rust via PyO3           
+```
+
+Choose any combination – conflicting options warn and fall back to safe defaults.
+
+---
+
+## 🛡️ Reliability
+
+```python
+from pipeline import retry, circuit_breaker
+
 step = retry(max_attempts=5, delay=0.5, backoff=2)(step)
-```
-
-### Circuit breaker
-
-```python
 step = circuit_breaker(threshold=3, timeout=60)(step)
 ```
 
-Both wrap the underlying `PipeStep` and work in sync/async contexts.
+Both decorators work for sync and async code. On repeated failures the circuit opens and short‑circuits upstream calls until the timeout elapses.
 
 ---
 
-## Advanced patterns
+## 🌐 Async API Example (Threaded I/O + Process CPU)
 
-### Fan‑out / fan‑in
+The framework plays nicely with `asyncio` — even when parts of your workload are blocking. Below is a **complete recipe** that:
+
+1. **Fetches JSON** from three public HTTP endpoints concurrently (thread pool, I/O‑bound).
+2. **Parses & summarises** the payload in a separate **process pool** (CPU‑bound).
+3. Streams the combined result back to the main coroutine.
 
 ```python
-branch1 = step_a | step_b
-branch2 = step_c
+import asyncio, aiohttp, json
+from pipeline import piped, PIPE, FanOutStep, FanInStep
 
-joined = FanOutStep((branch1, branch2), parallel='thread') |
-         FanInStep(lambda x, y: (x, y))
+# ── 1. I/O‑bound: threaded HTTP fetch ─────────────────────────────┐
+@piped(parallel='thread')
+async def fetch_json(url: str) -> dict:
+    async with aiohttp.ClientSession() as sess:
+        async with sess.get(url, timeout=10) as resp:
+            return await resp.json()
+# ───────────────────────────────────────────────────────────────────┘
+
+# ── 2. CPU‑bound: process‑pool parsing ─────────────────────────────┐
+@piped(parallel='process')
+def summarise(data: dict) -> dict:
+    # pretend this is heavy crunching
+    title  = data.get('title', '')[:50]
+    length = len(json.dumps(data))
+    return {'title': title, 'bytes': length}
+# ───────────────────────────────────────────────────────────────────┘
+
+# Build three identical fetch→summarise branches
+BRANCH = fetch_json | summarise
+urls = [
+    'https://jsonplaceholder.typicode.com/posts/1',
+    'https://jsonplaceholder.typicode.com/posts/2',
+    'https://jsonplaceholder.typicode.com/posts/3',
+]
+branches = tuple(BRANCH(url) for url in urls)  # partial‑apply URL
+
+pipeline = (
+    FanOutStep(branches) |                 # run 3 branches in parallel threads
+    FanInStep(lambda *results: list(results))
+)
+
+async def main():
+    summaries = await pipeline.async_run()
+    for s in summaries:
+        print(s)
+
+asyncio.run(main())
 ```
 
-### Map‑reduce
+**What to notice**
+
+| Aspect               | Detail                                                                                                           |
+| -------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| **Thread pool**      | `parallel='thread'` lets blocking `aiohttp` calls coexist with the event‑loop without freezing it.               |
+| **Process pool**     | `parallel='process'` offloads heavy CPU work; each summary happens in a separate OS process.                     |
+| **Fan‑out / Fan‑in** | `FanOutStep` rockets the same seed into multiple branches; `FanInStep` stitches their outputs together in order. |
+| **Error handling**   | Both steps inherit retry/circuit‑breaker wrappers automatically if you add them.                                 |
+
+---
+
+## 🕸 Advanced Usage
+
+### Fan‑out / Fan‑in Example
+
+```python
+branch_a = piped(lambda x: x ** 2)
+branch_b = piped(lambda x: x ** 3)
+
+combined = (
+    FanOutStep((branch_a, branch_b), parallel='thread') |
+    FanInStep(lambda sq, cube: sq + cube)
+)
+
+print(combined.run(3))  # 👉 36
+```
+
+### Map‑Reduce Example
 
 ```python
 mapper  = piped(lambda x: x * x)
 reducer = lambda xs: sum(xs)
 
-square_sum = MapReduceStep(mapper, reducer, batch_size=100)
+square_sum = MapReduceStep(mapper, reducer, batch_size=256)
+print(square_sum.run(range(1_000_000)))
 ```
 
-### Timeouts
+### Cancellation & Timeouts
 
-Every `PipeStep` accepts a `timeout` parameter that terminates long‑running work.
+```python
+with pipeline as p:          # pools auto‑cleaned on exit
+    try:
+        p.cancel()           # from another thread/task
+    except asyncio.CancelledError:
+        ...                  # handle cleanly
+```
 
----
-
-## API reference
-
-Full doc‑strings are available at runtime (`help(PipeStep)` etc.).  Key types:
-
-* `piped(...)` – decorator returning a `PipeStep`
-* `retry(...)` – adds exponential back‑off
-* `circuit_breaker(...)`
-* `Pipeline.run(seed)` / `Pipeline.async_run(seed)`
-* `ExecutionResult` – returned by `Pipeline.run_detailed()`
-* `cleanup_pools()` – free thread / process pools (automatically invoked on `with` block exit)
+Each `PipeStep` can also specify a `timeout=...` (seconds).
 
 ---
 
-## Contributing
+## 📚 API Cheatsheet
 
-1. Fork the repo & create a feature branch
-2. `pre‑commit install`
-3. Add **tests** for any new behaviour (`pytest`)
-4. Ensure `ruff` passes (`ruff --fix .`)
-5. Submit a PR 🚀
+```text
+piped(...):               → PipeStep              # decorator
+retry(...):               PipeStep → PipeStep     # wrapper
+circuit_breaker(...):     PipeStep → PipeStep
+
+Pipeline.run(seed=None)           → result
+Pipeline.async_run(seed=None)     → awaitable
+Pipeline.run_detailed(seed=None)  → ExecutionResult(value, history, dt, n)
+
+FanOutStep/ FanInStep / MapReduceStep  – graph helpers
+cleanup_pools()                     – free all executors
+```
+
+Full doc‑strings are available in the source; type hints are 100 %.
 
 ---
 
+## 💡 Best Practices
+
+* Keep steps **pure** and side‑effect‑free whenever possible.
+* Use `parallel='process'` only for CPU‑bound, pickle‑friendly work.
+* Prefer **batching** for I/O‑bound tasks (database, network).
+* Chain retries **before** circuit‑breakers: `retry(...)` → `circuit_breaker(...)`.
+* Call `cleanup_pools()` or use a `with` block when embedding in long‑lived services.
+
+---
+
+## 🛠 Troubleshooting & FAQ
+
+| Symptom                      | Fix                                                           |
+| ---------------------------- | ------------------------------------------------------------- |
+| Hanging on Windows           | Ensure `parallel='process'` uses the default *spawn* context. |
+| `CircuitBreakerError` raised | Wait `timeout` seconds or reset by restarting the pipeline.   |
+| `RetryExhaustedError` raised | Increase `max_attempts` or inspect the underlying error.      |
+| Function not pickleable      | Switch to `parallel='thread'` or make the function top‑level  |
+
+---
+
+## 🤝 Contributing
+
+1. **Fork** → **create feature branch** → **commit** → **PR**.
+2. Run `pre-commit install` to auto‑format with **ruff** & **black**.
+3. All features need unit tests (`pytest`).
+
+---
+
+## 📝 License
+
+Distributed under the MIT License. See `LICENSE` for more information.
+
+---
+
+### Acknowledgements
+
+Inspired by ideas from Luigi, Apache Beam, Prefect, and countless Reddit threads on "why is my pipeline so slow?" 🙃
